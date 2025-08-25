@@ -1,0 +1,6 @@
+[
+  {"q": "Who stores beans in WA with non-GMO certification?",
+   "must_include": ["State:WA","Crop:Beans","Certification:Non-GMO"]},
+  {"q": "Which business types handle grains in Oregon?",
+   "must_include": ["State:OR","Crop:Grain"]}
+]
