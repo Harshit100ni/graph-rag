@@ -73,6 +73,38 @@ TOOLS = [
                 "additionalProperties": False
             }
         }
+    },
+    {
+    "type": "function",
+    "function": {
+        "name": "ask_cypher",
+        "description": "Use when the question should be answered via LLM-generated Cypher over the live graph schema (no hardcoded query).",
+        "parameters": {
+        "type": "object",
+        "properties": {
+            "top_k": {"type":"integer","description":"Max rows for the Cypher chain to consider","default":25}
+        },
+        "required": [],
+        "additionalProperties": False
+        }
+    }
+    },
+    {
+    "type": "function",
+    "function": {
+        "name": "ask_hybrid_generic",
+        "description": "Use for hybrid retrieval with generic 1-hop APOC expansion (no hardcoded rel types).",
+        "parameters": {
+        "type": "object",
+        "properties": {
+            "k": {"type":"integer","default":8},
+            "per_seed": {"type":"integer","default":20},
+            "org_limit": {"type":"integer","default":25}
+        },
+        "required": [],
+        "additionalProperties": False
+        }
+    }
     }
 ]
 
@@ -151,6 +183,41 @@ def ask_route(body: RouteBody):
             "answer": answer,
             "facts": facts,
             "citations": citations
+        }
+    
+    elif name == "ask_cypher":
+        # Let the chain write & run Cypher; we just return the result.
+        top_k = int(args.get("top_k", 25))
+        chain = get_cypher_chain()
+        # NOTE: GraphCypherQAChain doesn’t take top_k at invoke time — the chain was created with top_k=25.
+        out = chain.invoke({"query": body.question})
+        # Optional: expose generated Cypher for debugging
+        steps = out.get("intermediate_steps") or []
+        cy = None
+        if steps and isinstance(steps, list) and isinstance(steps[0], dict):
+            cy = steps[0].get("cypher")
+        return {
+            "router_tool": {"name": name, "args": args},
+            "answer": out.get("result"),
+            "facts": None,
+            "citations": [],
+            "generated_cypher": cy,
+            "intermediate_steps": steps,
+        }
+
+    elif name == "ask_hybrid_generic":
+        k = int(args.get("k", body.k))
+        per_seed = int(args.get("per_seed", 20))
+        org_limit = int(args.get("org_limit", body.org_limit))
+        rows = hybrid_retriever_generic(body.question, k=k, per_seed=per_seed, org_limit=org_limit)
+        facts, citations = make_triple_facts(rows)
+        answer = answer_from_facts(body.question, facts) if rows else "I don’t know."
+        return {
+            "router_tool": {"name": name, "args": args},
+            "answer": answer,
+            "facts": facts,
+            "citations": citations,
+            "triples": rows
         }
 
     raise HTTPException(status_code=400, detail=f"Unknown tool selected: {name}")
