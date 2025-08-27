@@ -14,41 +14,37 @@ _CHAIN: Optional[GraphCypherQAChain] = None
 _SCHEMA_TEXT: Optional[str] = None
 _GRAPH: Optional[Neo4jGraph] = None
 
+# One automatic repair attempt is usually enough to turn a syntax/runtime error
+# into a good query when the model sees the Neo4j error text.
+MAX_REPAIRS = 1
+
 
 def _make_value_hints_text(max_labels: int = 10, max_examples_per_label: int = 10) -> str:
-    """
-    Build a short, generic sample-values block from the live schema snapshot.
-    No domain hardcoding; just examples so the model chooses the right props.
-    """
-    snap = schema_snapshot()  # cached by schema_reader
+    snap = schema_snapshot()
     lines: List[str] = []
     used = 0
     for lab, meta in snap.get("label_props", {}).items():
         if used >= max_labels:
             break
         samples = meta.get("samples") or []
+        # samples can be simple strings; if your schema_reader can provide prop:value pairs,
+        # show them; otherwise just print the examples you have.
         if not samples:
             continue
-        examples = ", ".join(samples[:max_examples_per_label])
-        lines.append(f"- {lab} examples: {examples}")
+        ex = ", ".join(samples[:max_examples_per_label])
+        lines.append(f"- {lab} sample values: {ex}")
         used += 1
     return "\n".join(lines) if lines else "(no example values available)"
 
-
 def _maybe_add_count_hint(q: str) -> str:
-    """
-    If user asks which/most/top/how many/etc, nudge toward COUNT/GROUP BY.
-    """
+    """If user asks which/most/top/how many/etc, nudge toward COUNT/GROUP BY."""
     if re.search(r"\b(which|most|top|how many|count|largest|fewest|highest|lowest|rank|popular)\b", q, re.I):
         q += "\n\n(If applicable, use COUNT(DISTINCT ...) with GROUP BY and ORDER BY.)"
     return q
 
 
 def _extract_generated_cypher(intermediate_steps: Any) -> Optional[str]:
-    """
-    GraphCypherQAChain puts generated query into intermediate steps.
-    Different versions may use 'query' or 'cypher'.
-    """
+    """GraphCypherQAChain puts generated query into intermediate steps ('query' or 'cypher')."""
     try:
         steps = intermediate_steps or []
         if not steps or not isinstance(steps[0], dict):
@@ -59,9 +55,7 @@ def _extract_generated_cypher(intermediate_steps: Any) -> Optional[str]:
 
 
 def _format_context_preview(intermediate_steps: Any, max_rows: int = 40) -> str:
-    """
-    Render a compact preview of the rows the generated Cypher returned.
-    """
+    """Render a compact preview of the rows the generated Cypher returned."""
     try:
         steps = intermediate_steps or []
         if not steps or not isinstance(steps[0], dict):
@@ -90,21 +84,19 @@ def get_chain(force_refresh_schema: bool = False) -> GraphCypherQAChain:
     if _CHAIN is not None and not force_refresh_schema:
         return _CHAIN
 
-    # Neo4j connection (read-only creds recommended)
     _GRAPH = Neo4jGraph(
         url=settings.neo4j_uri,
         username=settings.neo4j_user,
         password=settings.neo4j_pass,
     )
-    # (Optional) If you want to force schema refresh on every boot:
-    # _GRAPH.refresh_schema()
+    # If you ever want to force schema reload: _GRAPH.refresh_schema()
 
     snap = schema_snapshot()
     _SCHEMA_TEXT = schema_text_for_llm(snap)
     value_hints_text = _make_value_hints_text()
 
-    cypher_llm = ChatOpenAI(model=settings.chat_model, temperature=0, api_key=settings.openai_key)
-    qa_llm     = ChatOpenAI(model=settings.chat_model, temperature=0, api_key=settings.openai_key)
+    cypher_llm = ChatOpenAI(model=settings.chat_model, temperature=0.1, api_key=settings.openai_key)
+    qa_llm     = ChatOpenAI(model=settings.chat_model, temperature=0.2, api_key=settings.openai_key)
 
     prompt_partial = _CYPHER_PROMPT.partial(
         schema=_SCHEMA_TEXT or "(schema unavailable)",
@@ -116,12 +108,39 @@ def get_chain(force_refresh_schema: bool = False) -> GraphCypherQAChain:
         qa_llm=qa_llm,
         graph=_GRAPH,
         cypher_prompt=prompt_partial,
-        allow_dangerous_requests=True,  
+        allow_dangerous_requests=True,
         validate_cypher=True,
         return_intermediate_steps=True,
         top_k=25,
     )
     return _CHAIN
+
+
+def _invoke_with_repair(chain: GraphCypherQAChain, q: str) -> Dict[str, Any]:
+    """
+    Invoke the chain once; on failure, append the Neo4j error text and ask
+    the model to regenerate a corrected query (MAX_REPAIRS times).
+    """
+    attempts = 0
+    last_err = None
+    while attempts <= MAX_REPAIRS:
+        try:
+            return chain.invoke({"query": q})
+        except Exception as e:
+            last_err = e
+            attempts += 1
+            if attempts > MAX_REPAIRS:
+                break
+            # Feed the database error back to the LLM to fix the query.
+            q = (
+                q
+                + "\n\nThe previously generated Cypher failed with this database error:\n"
+                + f"{type(e).__name__}: {e}\n"
+                + "Please regenerate ONE corrected Cypher query using ONLY the provided schema. "
+                  "Return only the query (no explanations)."
+            )
+    # If we get here, repair failed
+    raise last_err if last_err else RuntimeError("Unknown Cypher QA failure")
 
 
 def run_cypher_qa(
@@ -131,9 +150,9 @@ def run_cypher_qa(
     force_refresh_schema: bool = False,
 ) -> Dict[str, Any]:
     """
-    Execute the Cypher QA chain with generic schema/value grounding.
+    Execute the Cypher QA chain with generic schema/value grounding and one repair attempt.
     Returns:
-      - result: final answer
+      - result: final answer (short)
       - cypher: generated query (if available)
       - steps: raw intermediate steps (for debugging)
       - context: compact preview of rows returned by the Cypher
@@ -145,9 +164,9 @@ def run_cypher_qa(
         q = _maybe_add_count_hint(q)
 
     try:
-        out: Dict[str, Any] = chain.invoke({"query": q})
+        out: Dict[str, Any] = _invoke_with_repair(chain, q)
         steps = out.get("intermediate_steps") or []
-        cypher_text = _extract_generated_cypher(steps)
+        cypher_text = _extract_generated_cypher(steps) or "(unavailable)"
         ctx_preview = _format_context_preview(steps, max_rows=max_ctx_rows)
         result_text = out.get("result") or "I don't know."
 
